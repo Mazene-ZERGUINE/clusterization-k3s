@@ -36,3 +36,5 @@ junit.xml
 *.njsproj
 *.sln
 *.sw?
+
+kubernetes/10-secrets.yaml

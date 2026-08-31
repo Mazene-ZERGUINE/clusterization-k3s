@@ -1,0 +1,105 @@
+services:
+  mongodb:
+    image: mongodb/mongodb-atlas-local
+    hostname: mongodb
+    ports:
+      - 27017:27017
+    volumes:
+      - ./init:/docker-entrypoint-initdb.d
+      - db:/data/db
+      - configdb:/data/configdb
+      - mongot:/data/mongot
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 40s
+
+  auth-service:
+    build:
+      context: ./services/auth-service
+      target: dev
+    init: true
+    ports:
+      - 3001:3001
+    volumes:
+      - ./services/auth-service:/app
+      - /app/node_modules
+    environment:
+      - NODE_ENV=development
+      - APP_ENV=${APP_ENV:-development}
+      - PORT=3001
+      - MONGODB_URI=${AUTH_MONGODB_URI}
+      - JWT_SECRET=${JWT_SECRET:?JWT_SECRET is required}
+      - CORS_ORIGIN=${CORS_ORIGIN}
+    depends_on:
+      mongodb:
+        condition: service_healthy
+
+  product-service:
+    build:
+      context: ./services/product-service
+      target: dev
+    init: true
+    ports:
+      - 3000:3000
+    volumes:
+      - ./services/product-service:/app
+      - /app/node_modules
+    environment:
+      - NODE_ENV=development
+      - APP_ENV=${APP_ENV:-development}
+      - PORT=3000
+      - MONGODB_URI=${PRODUCT_MONGODB_URI}
+      - JWT_SECRET=${JWT_SECRET:?JWT_SECRET is required}
+      - CORS_ORIGIN=${CORS_ORIGIN}
+    depends_on:
+      mongodb:
+        condition: service_healthy
+
+  order-service:
+    build:
+      context: ./services/order-service
+      target: dev
+    init: true
+    ports:
+      - 3002:3002
+    volumes:
+      - ./services/order-service:/app
+      - /app/node_modules
+    environment:
+      - NODE_ENV=development
+      - APP_ENV=${APP_ENV:-development}
+      - PORT=3002
+      - MONGODB_URI=${ORDER_MONGODB_URI}
+      - JWT_SECRET=${JWT_SECRET:?JWT_SECRET is required}
+      - CORS_ORIGIN=${CORS_ORIGIN}
+    depends_on:
+      mongodb:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: ./frontend
+      target: dev
+    init: true
+    ports:
+      - ${FRONTEND_PORT:-8080}:8080
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    environment:
+      - NODE_ENV=development
+      - AUTH_SERVICE_URL=${AUTH_SERVICE_URL}
+      - PRODUCT_SERVICE_URL=${PRODUCT_SERVICE_URL}
+      - ORDER_SERVICE_URL=${ORDER_SERVICE_URL}
+    depends_on:
+      - auth-service
+      - product-service
+      - order-service
+
+volumes:
+  db:
+  configdb:
+  mongot:
