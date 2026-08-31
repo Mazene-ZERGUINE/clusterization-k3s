@@ -14,6 +14,9 @@ dist-ssr
 *.local
 .vite
 
+kubernetes/12-tls-secret.yaml
+k3s-kubeconfig.yaml
+
 .env
 .env.*
 !.env.example
