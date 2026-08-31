@@ -3,7 +3,6 @@ import { runtimeConfig } from './runtime.js';
 
 export const connectDB = async () => {
   try {
-    // Ne pas se connecter si déjà connecté ou en mode test
     if (mongoose.connection.readyState !== 0 || runtimeConfig.isTest) {
       console.log('MongoDB already connected');
       return;
