@@ -1,0 +1,24 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config
+  namespace: cluster-project
+  labels:
+    app.kubernetes.io/part-of: cluster-project
+data:
+  APP_ENV: "production"
+  NODE_ENV: "production"
+  CORS_ORIGIN: "http://cluster-project.local"
+---
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: service-urls
+  namespace: cluster-project
+  labels:
+    app.kubernetes.io/part-of: cluster-project
+data:
+  AUTH_SERVICE_URL: "http://auth-service:3001"
+  PRODUCT_SERVICE_URL: "http://product-service:3000"
+  ORDER_SERVICE_URL: "http://order-service:3002"
