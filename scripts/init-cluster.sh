@@ -1,41 +1,40 @@
 #!/usr/bin/env bash
+set -e
+set -u
+set -o pipefail
 
-set -euo pipefail
 
 
-IMAGE="${IMAGE:-24.04}"
-CPUS="${CPUS:-2}"
-MEMORY="${MEMORY:-2G}"
-DISK="${DISK:-10G}"
+IMAGE="24.04"
+CPUS="2"
+MEMORY="2G"
+DISK="10G"
 
-K3S_CHANNEL="${K3S_CHANNEL:-stable}"
-SUBNET="${SUBNET:-}"
-GATEWAY="${GATEWAY:-}"
-KEEP_DHCP="${KEEP_DHCP:-yes}"
-KUBECONFIG_OUT="${KUBECONFIG_OUT:-$PWD/k3s-kubeconfig.yaml}"
-DB_NODE_LABEL="${DB_NODE_LABEL:-role=database}"
+K3S_CHANNEL="stable"
+DB_NODE_LABEL="role=database"
+KUBECONFIG_OUT="$PWD/k3s-kubeconfig.yaml"
 
-PROBE_TIMEOUT="${PROBE_TIMEOUT:-10}"
-EXEC_TIMEOUT="${EXEC_TIMEOUT:-60}"
-LONG_TIMEOUT="${LONG_TIMEOUT:-900}"
+SERVER="k3s-server"
+AGENT1="k3s-agent-1"
+AGENT2="k3s-agent-2"
 
-NODES=(k3s-server k3s-agent-1 k3s-agent-2)
-OCTETS=(241       242         243)
-
+SUBNET=""
+GATEWAY=""
 SERVER_IP=""
-TOKEN=""
+AGENT1_IP=""
+AGENT2_IP=""
 
+TMP_NETPLAN=$(mktemp)
+TMP_TOKEN=$(mktemp)
 
-BLUE=$'\033[1;34m'; GREEN=$'\033[1;32m'; YELLOW=$'\033[1;33m'; RED=$'\033[1;31m'; OFF=$'\033[0m'
-
-log()  { printf '%s==>%s %s\n'   "$BLUE"   "$OFF" "$*"; }
-ok()   { printf '%s  ok%s %s\n'  "$GREEN"  "$OFF" "$*"; }
-warn() { printf '%s warn%s %s\n' "$YELLOW" "$OFF" "$*" >&2; }
-die()  { printf '%serror%s %s\n' "$RED"    "$OFF" "$*" >&2; exit 1; }
-
-TMPFILE=$(mktemp)
 NULLOUT=$(mktemp)
-trap 'rm -f "$TMPFILE" "$NULLOUT"' EXIT
+trap 'rm -f "$TMP_NETPLAN" "$TMP_TOKEN" "$NULLOUT"' EXIT
+
+say()  { echo; echo "==> $*"; }
+ok()   { echo "    ok: $*"; }
+warn() { echo "    warning: $*" >&2; }
+die()  { echo "ERROR: $*" >&2; exit 1; }
+
 
 TIMEOUT_CMD=""
 if command -v timeout >/dev/null 2>&1; then
@@ -44,18 +43,13 @@ elif command -v gtimeout >/dev/null 2>&1; then
   TIMEOUT_CMD=gtimeout
 fi
 
-
-
 run_limited() {
-  local seconds=$1
-  shift
+  local seconds=$1; shift
   local rc=0
-
   if [ -n "$TIMEOUT_CMD" ]; then
     "$TIMEOUT_CMD" -k 5 "$seconds" "$@" || rc=$?
     return "$rc"
   fi
-
   "$@" &
   local pid=$!
   ( sleep "$seconds"; kill -TERM "$pid"; sleep 5; kill -KILL "$pid" ) >/dev/null 2>&1 &
@@ -66,93 +60,105 @@ run_limited() {
   return "$rc"
 }
 
-retry() {
-  local attempts=$1 pause=$2
-  shift 2
-  local n=1
-  until "$@"; do
-    n=$((n + 1))
-    if [ "$n" -gt "$attempts" ]; then
-      return 1
+in_vm()       { run_limited "${EXEC_TIMEOUT:-60}" multipass exec "$1" -- bash -c "$2" </dev/null; }
+in_vm_quiet() { run_limited "${PROBE_TIMEOUT:-10}" multipass exec "$1" -- bash -c "( $2 ) >/dev/null 2>&1" </dev/null >"$NULLOUT" 2>&1; }
+
+wait_for() {
+  local tries="$1"
+  local pause="$2"
+  local vm="$3"
+  local command="$4"
+  local i
+
+  for (( i = 1; i <= tries; i++ )); do
+    if in_vm_quiet "$vm" "$command"; then
+      return 0
     fi
     sleep "$pause"
   done
+
+  return 1
+}
+
+vm_exists() {
+  multipass info "$1" > /dev/null 2>&1
+}
+
+vm_is_running() {
+  multipass info "$1" 2>/dev/null | grep -i "^State" | grep -qi "running"
 }
 
 
-in_vm()      { run_limited "$EXEC_TIMEOUT" multipass exec "$1" -- bash -lc "$2" </dev/null; }
-in_vm_long() { run_limited "$LONG_TIMEOUT" multipass exec "$1" -- bash -lc "$2" </dev/null; }
+check_requirements() {
+  say "Checking that Multipass is available"
 
-# 'multipass exec' never returns when its stdout is /dev/null and the remote
-# command writes something, so probes discard the output inside the VM and send
-# whatever the client itself prints to a scratch file instead of /dev/null.
-probe()      { run_limited "$PROBE_TIMEOUT" multipass exec "$1" -- bash -lc "( $2 ) >/dev/null 2>&1" </dev/null >"$NULLOUT" 2>&1; }
+  command -v multipass > /dev/null 2>&1 \
+    || die "multipass is not installed - see https://multipass.run"
 
-vm_exists()  { run_limited 30 multipass info "$1" >/dev/null 2>&1; }
-vm_running() { run_limited 30 multipass info "$1" --format csv 2>/dev/null | tail -1 | cut -d, -f2 | grep -qi running; }
+  multipass version > /dev/null 2>&1 \
+    || die "the multipass daemon is not answering"
 
-ip_of() { echo "${SUBNET}.${OCTETS[$1]}"; }
-
-
-check_prereqs() {
-  command -v multipass >/dev/null 2>&1 || die "multipass is not installed (https://multipass.run)"
-  run_limited 30 multipass version >/dev/null 2>&1 || die "the multipass daemon is not responding"
-
-  if [ -z "$TIMEOUT_CMD" ]; then
-    warn "timeout(1) not found, using the built-in watchdog (brew install coreutils for gtimeout)"
-  fi
-
-  if [ "$KEEP_DHCP" != "yes" ] && [ "$(uname -s)" = "Darwin" ]; then
-    warn "KEEP_DHCP=no drops the DHCP lease multipass uses to reach the VM; 'multipass exec' will stop working"
-  fi
+  ok "multipass is ready"
 }
 
+
+launch_one_vm() {
+  local vm="$1"
+
+  if vm_exists "$vm"; then
+    if ! vm_is_running "$vm"; then
+      echo "    starting $vm"
+      multipass start "$vm" || die "cannot start $vm"
+    fi
+    ok "$vm already exists"
+  else
+    echo "    creating $vm (this takes a minute)"
+    multipass launch "$IMAGE" \
+      --name "$vm" \
+      --cpus "$CPUS" \
+      --memory "$MEMORY" \
+      --disk "$DISK" \
+      || die "cannot create $vm"
+    ok "$vm created"
+  fi
+
+  wait_for 30 2 "$vm" "true" || die "$vm does not answer to 'multipass exec'"
+}
 
 launch_vms() {
-  log "Launching the virtual machines"
-
-  for vm in "${NODES[@]}"; do
-    if vm_exists "$vm"; then
-      if ! vm_running "$vm"; then
-        log "starting $vm"
-        run_limited "$LONG_TIMEOUT" multipass start "$vm" || die "cannot start $vm"
-      fi
-      ok "$vm already exists"
-    else
-      run_limited "$LONG_TIMEOUT" multipass launch "$IMAGE" \
-        --name "$vm" --cpus "$CPUS" --memory "$MEMORY" --disk "$DISK" \
-        || die "$vm: launch failed or timed out after ${LONG_TIMEOUT}s"
-      ok "$vm created"
-    fi
-
-    retry 30 2 probe "$vm" "true" || die "$vm: no response to 'multipass exec' after launch"
-  done
-
+  say "Creating the virtual machines"
+  launch_one_vm "$SERVER"
+  launch_one_vm "$AGENT1"
+  launch_one_vm "$AGENT2"
   multipass list
 }
 
 
-detect_network() {
-  retry 30 2 probe k3s-server "ip -4 -o addr show scope global | grep -q ." \
-    || die "k3s-server has no IPv4 address yet"
+find_network() {
+  say "Looking at the network Multipass is using"
 
-  local addr
-  addr=$(in_vm k3s-server "ip -4 -o addr show scope global | awk '{print \$4}' | cut -d/ -f1 | head -1") \
-    || die "cannot read the address of k3s-server"
-  [ -n "$addr" ] || die "k3s-server has no IPv4 address yet"
+  wait_for 30 2 "$SERVER" "ip -4 -o addr show scope global | grep -q ." \
+    || die "$SERVER has no IP address yet"
 
-  if [ -z "$SUBNET" ]; then
-    SUBNET=$(echo "$addr" | cut -d. -f1-3)
-  fi
+  local address
+  address=$(in_vm "$SERVER" "ip -4 -o addr show scope global | awk '{print \$4}' | cut -d/ -f1 | head -1") \
+    || die "cannot read the address of $SERVER"
+
+  SUBNET=$(echo "$address" | cut -d. -f1-3)
+
+  GATEWAY=$(in_vm "$SERVER" "ip -4 route show default | awk '{print \$3}' | head -1") || GATEWAY=""
   if [ -z "$GATEWAY" ]; then
-    GATEWAY=$(in_vm k3s-server "ip -4 route show default | awk '{print \$3}' | head -1") || GATEWAY=""
-  fi
-  if [ -z "$GATEWAY" ]; then
-    GATEWAY="${SUBNET}.1"
+    GATEWAY="$SUBNET.1"
   fi
 
-  SERVER_IP=$(ip_of 0)
-  log "Subnet ${SUBNET}.0/24 - gateway ${GATEWAY} - control plane ${SERVER_IP}"
+  SERVER_IP="$SUBNET.241"
+  AGENT1_IP="$SUBNET.242"
+  AGENT2_IP="$SUBNET.243"
+
+  echo "    subnet:        $SUBNET.0/24"
+  echo "    gateway:       $GATEWAY"
+  echo "    control plane: $SERVER_IP"
+  echo "    workers:       $AGENT1_IP, $AGENT2_IP"
 }
 
 
@@ -165,219 +171,205 @@ netplan_id_of() {
   echo "$id"
 }
 
-write_netplan_config() {
-  local iface_id=$1 ip=$2
+set_static_ip() {
+  local vm="$1"
+  local ip="$2"
 
-  {
-    echo "network:"
-    echo "  version: 2"
-    echo "  ethernets:"
-    echo "    ${iface_id}:"
-    echo "      addresses: [${ip}/24]"
-
-    if [ "$KEEP_DHCP" = "yes" ]; then
-      echo "      dhcp4: true"
-      echo "      dhcp4-overrides:"
-      echo "        use-routes: false"
-    else
-      echo "      dhcp4: false"
-    fi
-
-    echo "      routes:"
-    echo "        - to: default"
-    echo "          via: ${GATEWAY}"
-
-    if [ "$KEEP_DHCP" != "yes" ]; then
-      echo "      nameservers:"
-      echo "        addresses: [${GATEWAY}, 1.1.1.1]"
-    fi
-  } > "$TMPFILE"
-}
-
-rollback_netplan() {
-  local vm=$1
-  warn "$vm: rolling back /etc/netplan/99-k3s-static.yaml"
-  probe "$vm" "sudo rm -f /etc/netplan/99-k3s-static.yaml" || true
-  probe "$vm" "sudo systemd-run --collect --unit=k3s-netplan-rollback --no-block netplan apply" || true
-}
-
-configure_one_ip() {
-  local vm=$1 ip=$2
-  local iface id
-
-  iface=$(in_vm "$vm" "ip -4 route show default | awk '{print \$5}' | head -1") \
-    || die "$vm: cannot determine the network interface"
-  [ -n "$iface" ] || die "$vm: cannot determine the network interface"
-
-  id=$(netplan_id_of "$vm")
-  [ -n "$id" ] || id=$iface
-
-  write_netplan_config "$id" "$ip"
-
-  local held=no
-  if probe "$vm" "ip -4 -o addr show | grep -q ' ${ip}/24 '"; then
-    held=yes
-  fi
-
-  if [ "$held" = "yes" ] \
-     && in_vm "$vm" "sudo cat /etc/netplan/99-k3s-static.yaml 2>/dev/null" | diff -q - "$TMPFILE" >/dev/null 2>&1; then
-    ok "$vm already holds $ip"
+  if in_vm_quiet "$vm" "ip -4 -o addr show | grep -q ' $ip/24 '"; then
+    ok "$vm already has $ip"
     return 0
   fi
 
-  if [ "$held" = "no" ] && probe k3s-server "ping -c1 -W1 ${ip}"; then
-    warn "$vm: ${ip} already answers on this subnet - change SUBNET/OCTETS if the cluster misbehaves"
-  fi
+  local interface
+  interface=$(in_vm "$vm" "ip -4 route show default | awk '{print \$5}' | head -1") \
+    || die "$vm: cannot find the network interface"
+  [ -n "$interface" ] || die "$vm: cannot find the network interface"
 
-  run_limited "$EXEC_TIMEOUT" multipass transfer "$TMPFILE" "${vm}:/tmp/99-k3s-static.yaml" \
+  local id
+  id=$(netplan_id_of "$vm")
+  [ -n "$id" ] || id="$interface"
+
+  cat > "$TMP_NETPLAN" <<EOF
+network:
+  version: 2
+  ethernets:
+    # This key must match the one cloud-init already uses (often "default",
+    # not the kernel name) or netplan writes a second, ignored .network unit.
+    $id:
+      # DHCP stays ON. Multipass uses the DHCP lease to reach the VM, so
+      # turning it off would break "multipass exec" and you would have to
+      # repair the machine from its console.
+      dhcp4: true
+      dhcp4-overrides:
+        use-routes: false
+      # The fixed address we actually want Kubernetes to use.
+      addresses: [$ip/24]
+      routes:
+        - to: default
+          via: $GATEWAY
+EOF
+
+  multipass transfer "$TMP_NETPLAN" "$vm:/tmp/99-k3s-static.yaml" \
     || die "$vm: cannot copy the netplan file"
+
   in_vm "$vm" "sudo install -m 600 -o root -g root /tmp/99-k3s-static.yaml /etc/netplan/99-k3s-static.yaml" \
     || die "$vm: cannot install the netplan file"
 
   if ! in_vm "$vm" "sudo netplan generate"; then
-    rollback_netplan "$vm"
-    die "$vm: netplan rejected the configuration"
+    in_vm "$vm" "sudo rm -f /etc/netplan/99-k3s-static.yaml" || true
+    die "$vm: netplan refused this configuration"
   fi
 
+  in_vm "$vm" "sudo systemd-run --collect --unit=k3s-netplan --no-block netplan apply" || true
 
-  if probe "$vm" "command -v systemd-run"; then
-    in_vm "$vm" "sudo systemd-run --collect --unit=k3s-netplan-apply --no-block netplan apply" || true
-  else
-    in_vm "$vm" "sudo setsid nohup netplan apply </dev/null >/dev/null 2>&1 & exit 0" || true
+  if ! wait_for 45 2 "$vm" "ip -4 -o addr show | grep -q ' $ip/24 '"; then
+    undo_static_ip "$vm"
+    die "$vm: the address $ip never came up"
   fi
 
-  if ! retry 45 2 probe "$vm" "ip -4 -o addr show | grep -q ' ${ip}/24 '"; then
-    rollback_netplan "$vm"
-    die "$vm: address $ip never came up"
+  if ! wait_for 20 3 "$vm" "ip -4 route show default | grep -q . && getent hosts get.k3s.io > /dev/null"; then
+    undo_static_ip "$vm"
+    die "$vm: lost its default route or DNS after the change"
   fi
 
-  if ! retry 20 3 probe "$vm" "ip -4 route show default | grep -q . && getent hosts get.k3s.io >/dev/null"; then
-    rollback_netplan "$vm"
-    die "$vm: lost the default route or DNS after applying $ip"
-  fi
-
-  if ! retry 20 2 probe "$vm" "ip -4 route get 1.1.1.1 | grep -q 'src ${ip}'"; then
-    rollback_netplan "$vm"
-    die "$vm: ${ip} is not the preferred source address"
-  fi
-
-  ok "$vm -> $ip ($iface, netplan id '$id')"
+  ok "$vm -> $ip (interface $interface, netplan id '$id')"
 }
 
-configure_static_ips() {
-  log "Applying the static addresses via netplan"
-  for i in "${!NODES[@]}"; do
-    configure_one_ip "${NODES[$i]}" "$(ip_of "$i")"
-  done
+undo_static_ip() {
+  local vm="$1"
+  warn "$vm: undoing the network change"
+  in_vm_quiet "$vm" "sudo rm -f /etc/netplan/99-k3s-static.yaml" || true
+  in_vm_quiet "$vm" "sudo systemd-run --collect --unit=k3s-netplan-undo --no-block netplan apply" || true
 }
 
+
+
+set_static_ips() {
+  say "Giving each VM a fixed address"
+  set_static_ip "$SERVER" "$SERVER_IP"
+  set_static_ip "$AGENT1" "$AGENT1_IP"
+  set_static_ip "$AGENT2" "$AGENT2_IP"
+}
 
 install_server() {
-  log "Installing k3s on the control plane"
+  say "Installing k3s on the control plane ($SERVER)"
 
-  local need_install=yes
-  if probe k3s-server "systemctl is-active --quiet k3s"; then
-    if probe k3s-server "grep -qF '${SERVER_IP}' /etc/systemd/system/k3s.service"; then
-      need_install=no
-      ok "k3s server already running on ${SERVER_IP}"
-    else
-      warn "k3s server is bound to another address, reinstalling on ${SERVER_IP}"
-    fi
-  fi
-
-  if [ "$need_install" = "yes" ]; then
-    in_vm_long k3s-server "curl -sfL https://get.k3s.io | \
-      INSTALL_K3S_CHANNEL=${K3S_CHANNEL} sh -s - server \
-      --write-kubeconfig-mode 644 \
-      --node-ip ${SERVER_IP} \
-      --advertise-address ${SERVER_IP} \
-      --tls-san ${SERVER_IP}" || die "the k3s server installation failed"
+  if in_vm_quiet "$SERVER" "systemctl is-active --quiet k3s"; then
+    ok "k3s is already running here"
+  else
+    in_vm "$SERVER" "curl -sfL https://get.k3s.io | \
+      INSTALL_K3S_CHANNEL=$K3S_CHANNEL sh -s - server \
+        --write-kubeconfig-mode 644 \
+        --node-ip $SERVER_IP \
+        --advertise-address $SERVER_IP \
+        --tls-san $SERVER_IP" \
+      || die "the k3s server installation failed"
     ok "k3s server installed"
   fi
 
-  retry 60 2 probe k3s-server "sudo test -s /var/lib/rancher/k3s/server/node-token" \
-    || die "the node token never appeared"
-  TOKEN=$(in_vm k3s-server "sudo cat /var/lib/rancher/k3s/server/node-token") \
-    || die "cannot read the node token"
-  [ -n "$TOKEN" ] || die "the node token is empty"
+  wait_for 60 2 "$SERVER" "sudo test -s /var/lib/rancher/k3s/server/node-token" \
+    || die "the join token never appeared"
 
-  retry 60 3 probe k3s-server "sudo k3s kubectl get --raw /readyz >/dev/null" \
-    || warn "the API server is not reporting ready yet, continuing"
+  in_vm "$SERVER" "sudo cat /var/lib/rancher/k3s/server/node-token" > "$TMP_TOKEN" \
+    || die "cannot read the join token"
+  chmod 600 "$TMP_TOKEN"
+  [ -s "$TMP_TOKEN" ] || die "the join token is empty"
+
+  wait_for 60 3 "$SERVER" "sudo k3s kubectl get --raw /readyz > /dev/null" \
+    || warn "the API server is not ready yet, carrying on anyway"
 }
 
+
+join_agent() {
+  local vm="$1"
+  local ip="$2"
+
+  if in_vm_quiet "$vm" "systemctl is-active --quiet k3s-agent"; then
+    ok "$vm has already joined"
+    return 0
+  fi
+
+  wait_for 30 3 "$vm" "curl -sk --max-time 5 -o /dev/null https://$SERVER_IP:6443/ping" \
+    || die "$vm cannot reach the API server at $SERVER_IP:6443"
+
+  multipass transfer "$TMP_TOKEN" "$vm:/tmp/k3s-token" || die "$vm: cannot copy the token"
+  in_vm "$vm" "chmod 600 /tmp/k3s-token"
+
+  in_vm "$vm" "curl -sfL https://get.k3s.io | \
+    INSTALL_K3S_CHANNEL=$K3S_CHANNEL \
+    K3S_URL=https://$SERVER_IP:6443 \
+    K3S_TOKEN=\$(cat /tmp/k3s-token) sh -s - agent --node-ip $ip" \
+    || { in_vm_quiet "$vm" "rm -f /tmp/k3s-token" || true; die "$vm: the agent installation failed"; }
+
+  in_vm "$vm" "rm -f /tmp/k3s-token" || true
+  ok "$vm joined the cluster ($ip)"
+}
 
 join_agents() {
-  log "Joining the workers to the cluster"
-
-  for i in 1 2; do
-    local vm=${NODES[$i]}
-    local ip
-    ip=$(ip_of "$i")
-
-    if probe "$vm" "systemctl is-active --quiet k3s-agent" \
-       && probe "$vm" "grep -qF '${SERVER_IP}' /etc/systemd/system/k3s-agent.service.env"; then
-      ok "$vm already joined"
-      continue
-    fi
-
-    retry 30 3 probe "$vm" "curl -sk --max-time 5 -o /dev/null https://${SERVER_IP}:6443/ping" \
-      || die "$vm: cannot reach the API server at ${SERVER_IP}:6443"
-
-    in_vm_long "$vm" "curl -sfL https://get.k3s.io | \
-      INSTALL_K3S_CHANNEL=${K3S_CHANNEL} \
-      K3S_URL=https://${SERVER_IP}:6443 \
-      K3S_TOKEN=${TOKEN} sh -s - agent --node-ip ${ip}" || die "$vm: the k3s agent installation failed"
-
-    ok "$vm joined ($ip)"
-  done
+  say "Joining the workers to the cluster"
+  join_agent "$AGENT1" "$AGENT1_IP"
+  join_agent "$AGENT2" "$AGENT2_IP"
 }
 
+label_node() {
+  say "Labelling $AGENT1 with $DB_NODE_LABEL"
 
-label_nodes() {
-  [ -n "$DB_NODE_LABEL" ] || return 0
-
-  log "Labelling k3s-agent-1 with ${DB_NODE_LABEL}"
-  if ! retry 30 5 probe k3s-server "sudo k3s kubectl get node k3s-agent-1"; then
-    warn "k3s-agent-1 is not registered yet, skipping the label"
+  if ! wait_for 30 5 "$SERVER" "sudo k3s kubectl get node $AGENT1"; then
+    warn "$AGENT1 is not registered yet, skipping the label"
     return 0
   fi
 
-  if ! in_vm k3s-server "sudo k3s kubectl label node k3s-agent-1 ${DB_NODE_LABEL} --overwrite" >"$NULLOUT" 2>&1; then
-    warn "cannot apply the label: $(tail -1 "$NULLOUT")"
-    return 0
-  fi
-
-  if probe k3s-server "sudo k3s kubectl get nodes -l ${DB_NODE_LABEL} --no-headers | grep -qw k3s-agent-1"; then
+  if in_vm_quiet "$SERVER" "sudo k3s kubectl label node $AGENT1 $DB_NODE_LABEL --overwrite"; then
     ok "label applied"
   else
-    warn "k3s-agent-1 does not carry ${DB_NODE_LABEL}, the database pod will stay Pending"
+    warn "could not apply the label - a pod that requires it would stay Pending"
   fi
 }
 
-export_kubeconfig() {
-  log "Writing the kubeconfig to ${KUBECONFIG_OUT}"
 
-  in_vm k3s-server "sudo cat /etc/rancher/k3s/k3s.yaml" \
-    | sed "s#https://127.0.0.1:6443#https://${SERVER_IP}:6443#" > "$KUBECONFIG_OUT" \
+save_kubeconfig() {
+  say "Saving the kubeconfig to $KUBECONFIG_OUT"
+
+  in_vm "$SERVER" "sudo cat /etc/rancher/k3s/k3s.yaml" \
+    | sed "s#https://127.0.0.1:6443#https://$SERVER_IP:6443#" \
+    > "$KUBECONFIG_OUT" \
     || die "cannot export the kubeconfig"
 
   [ -s "$KUBECONFIG_OUT" ] || die "the exported kubeconfig is empty"
   chmod 600 "$KUBECONFIG_OUT"
-  ok "export KUBECONFIG=${KUBECONFIG_OUT}"
-}
-
-wait_ready() {
-  log "Waiting for the three nodes to be Ready"
-  retry 60 5 probe k3s-server \
-    "sudo k3s kubectl get nodes --no-headers 2>/dev/null | grep -cw Ready | grep -qx 3" \
-    || warn "the cluster is not fully Ready yet, current state below"
-  in_vm k3s-server "sudo k3s kubectl get nodes -o wide" || true
+  ok "use it with: export KUBECONFIG=$KUBECONFIG_OUT"
 }
 
 
-destroy() {
-  log "Deleting the virtual machines"
-  for vm in "${NODES[@]}"; do
+wait_until_ready() {
+  say "Waiting for the three nodes to be Ready"
+
+  wait_for 60 5 "$SERVER" \
+    "sudo k3s kubectl get nodes --no-headers | grep -cw Ready | grep -qx 3" \
+    || warn "the cluster is not fully Ready yet - here is its current state"
+
+  in_vm "$SERVER" "sudo k3s kubectl get nodes -o wide" || true
+}
+
+
+
+show_status() {
+  multipass list
+  if vm_exists "$SERVER"; then
+    in_vm "$SERVER" "sudo k3s kubectl get nodes -o wide" || true
+  fi
+}
+
+destroy_cluster() {
+  echo "This will delete $SERVER, $AGENT1 and $AGENT2 and everything on them."
+  read -r -p "Type yes to continue: " answer
+  if [ "$answer" != "yes" ]; then
+    echo "Nothing was deleted."
+    return 0
+  fi
+
+  say "Deleting the virtual machines"
+  for vm in "$SERVER" "$AGENT1" "$AGENT2"; do
     if vm_exists "$vm"; then
       multipass delete "$vm"
     fi
@@ -386,36 +378,33 @@ destroy() {
   ok "cluster removed"
 }
 
-status() {
-  multipass list
-  if vm_exists k3s-server; then
-    in_vm k3s-server "sudo k3s kubectl get nodes -o wide"
-  fi
-}
 
+command="${1:-up}"
 
-case "${1:-up}" in
+case "$command" in
   up)
-    check_prereqs
+    check_requirements
     launch_vms
-    detect_network
-    configure_static_ips
+    find_network
+    set_static_ips
     install_server
     join_agents
-    label_nodes
-    export_kubeconfig
-    wait_ready
-    printf '\n%sCluster ready.%s  kubectl --kubeconfig %s get nodes\n' "$GREEN" "$OFF" "$KUBECONFIG_OUT"
-    ;;
-  destroy)
-    check_prereqs
-    destroy
+    label_node
+    save_kubeconfig
+    wait_until_ready
+    echo
+    echo "Cluster ready. Try:"
+    echo "  kubectl --kubeconfig $KUBECONFIG_OUT get nodes"
     ;;
   status)
-    check_prereqs
-    status
+    check_requirements
+    show_status
+    ;;
+  destroy)
+    check_requirements
+    destroy_cluster
     ;;
   *)
-    die "unknown command: $1 (use: up | status | destroy)"
+    die "unknown command: $command (use: up, status or destroy)"
     ;;
 esac

@@ -3,7 +3,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-e="mazene"
+REGISTRY_USER="mazene"
 PREFIX="cluster-project"
 VERSION="${1:-1.0.0}"
 PLATFORMS="linux/amd64,linux/arm64"
